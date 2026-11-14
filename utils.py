@@ -269,7 +269,7 @@ class _HttpStreamSource:
     """Seekable view over a chunked HTTP body; keeps what it has read so the
     decoder can seek back while probing, and blocks for data it has not got."""
 
-    def __init__(self, response, chunk_size=4096):
+    def __init__(self, response, chunk_size=1024):
         self._it = response.iter_content(chunk_size=chunk_size)
         self._buf = bytearray()
         self._pos = 0
@@ -286,7 +286,11 @@ class _HttpStreamSource:
                 self._buf.extend(chunk)
 
     def read(self, num_bytes):
-        self._fill(self._pos + num_bytes)
+        # Short reads are fine for the decoder (it asks for ~16 KB but decodes
+        # any whole frame it has), so only block until *some* data is here.
+        # Returning b"" is reserved for the real end of the stream.
+        if self._pos >= len(self._buf):
+            self._fill(self._pos + 1)
         data = bytes(self._buf[self._pos:self._pos + num_bytes])
         self._pos += len(data)
         return data
