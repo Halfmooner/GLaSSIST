@@ -260,6 +260,150 @@ def _decode_audio_bytes(content, logger):
 
     return sf.read(io.BytesIO(content))
 
+def explicit_stream_disabled():
+    """HA_STREAM_TTS=false turns progressive playback off."""
+    return not get_env_bool("HA_STREAM_TTS", True)
+
+
+class _HttpStreamSource:
+    """Seekable view over a chunked HTTP body; keeps what it has read so the
+    decoder can seek back while probing, and blocks for data it has not got."""
+
+    def __init__(self, response, chunk_size=4096):
+        self._it = response.iter_content(chunk_size=chunk_size)
+        self._buf = bytearray()
+        self._pos = 0
+        self._eof = False
+
+    def _fill(self, upto):
+        while len(self._buf) < upto and not self._eof:
+            try:
+                chunk = next(self._it)
+            except StopIteration:
+                self._eof = True
+                break
+            if chunk:
+                self._buf.extend(chunk)
+
+    def read(self, num_bytes):
+        self._fill(self._pos + num_bytes)
+        data = bytes(self._buf[self._pos:self._pos + num_bytes])
+        self._pos += len(data)
+        return data
+
+    def seek(self, offset, origin):
+        import miniaudio
+        new = offset if origin == miniaudio.SeekOrigin.START else self._pos + offset
+        if new < 0:
+            return False
+        self._fill(new)
+        if new > len(self._buf):
+            return False
+        self._pos = new
+        return True
+
+
+def _try_stream_mp3(full_url, logger, animation_server=None):
+    """
+    Decode and play an MP3 while it is still downloading, so speech starts
+    with the first frames instead of after the whole file has arrived.
+    Returns True/False when it handled playback, or None to let the caller
+    fall back to download-then-play (no miniaudio, not MP3, early failure).
+    """
+    try:
+        import miniaudio
+    except ImportError:
+        return None
+
+    try:
+        response = requests.get(full_url, timeout=10, stream=True)
+    except Exception as e:
+        logger.warning(f"Streaming request failed, falling back: {e!r}")
+        return None
+    if response.status_code != 200:
+        response.close()
+        return None
+    ctype = (response.headers.get("Content-Type") or "").lower()
+    if "mpeg" not in ctype and "mp3" not in ctype and not full_url.lower().split("?")[0].endswith(".mp3"):
+        response.close()
+        return None
+
+    class _Source(miniaudio.StreamableSource):
+        def __init__(self, inner):
+            self.inner = inner
+
+        def read(self, num_bytes):
+            return self.inner.read(num_bytes)
+
+        def seek(self, offset, origin):
+            return self.inner.seek(offset, origin)
+
+    try:
+        out_rate = get_output_sample_rate()
+        if not out_rate:
+            try:
+                out_rate = int(sd.query_devices(get_output_device_index(), "output")["default_samplerate"])
+            except Exception:
+                out_rate = 48000
+        source = _Source(_HttpStreamSource(response))
+        frames = max(256, out_rate // 50)  # ~20 ms per chunk
+        gen = miniaudio.stream_any(
+            source,
+            source_format=miniaudio.FileFormat.MP3,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=1,
+            sample_rate=out_rate,
+            frames_to_read=frames,
+        )
+        # Pre-buffer ~150 ms before opening the device to avoid an initial underrun.
+        pending = []
+        buffered = 0
+        for chunk in gen:
+            arr = np.frombuffer(chunk, dtype=np.float32)
+            if arr.size:
+                pending.append(arr)
+                buffered += arr.size
+            if buffered >= out_rate * 0.15:
+                break
+        if not pending:
+            response.close()
+            return None
+    except Exception as e:
+        logger.warning(f"Streaming decode failed, falling back: {e!r}")
+        try:
+            response.close()
+        except Exception:
+            pass
+        return None
+
+    logger.info(f"Streaming playback ({out_rate}Hz)")
+    try:
+        device = get_output_device_index()
+        with sd.OutputStream(device=device, samplerate=out_rate, channels=1,
+                             dtype="float32") as output:
+            def _emit(arr):
+                output.write(arr.reshape(-1, 1))
+                if animation_server:
+                    _send_fft_to_animation((arr * 32767).astype(np.int16), animation_server)
+
+            for arr in pending:
+                _emit(arr)
+            for chunk in gen:
+                arr = np.frombuffer(chunk, dtype=np.float32)
+                if arr.size:
+                    _emit(arr)
+        logger.info("Streaming playback completed")
+        return True
+    except Exception as e:
+        logger.exception(f"Streaming playback error: {e}")
+        return False
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
 def play_audio_from_url(url, host, animation_server=None, done_callback=None,
                         output_device_index=None):
     """
@@ -290,6 +434,16 @@ def play_audio_from_url(url, host, animation_server=None, done_callback=None,
                 full_url = f"{protocol}://{host}{url}"
             else:
                 full_url = url
+
+            if not explicit_stream_disabled() and output_device_index is None:
+                streamed = _try_stream_mp3(full_url, logger, animation_server)
+                if streamed is not None:
+                    if done_callback:
+                        try:
+                            done_callback()
+                        except Exception as e:
+                            logger.error(f"done_callback error: {e}")
+                    return streamed
 
             logger.info(f"Downloading audio from: {full_url}")
 

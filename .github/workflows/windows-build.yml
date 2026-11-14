@@ -1,0 +1,97 @@
+name: Windows installer (streaming TTS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [streaming-tts]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: cmd
+        run: |
+          python -m venv venv
+          call venv\Scripts\activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Streaming playback smoke test
+        shell: cmd
+        run: |
+          call venv\Scripts\activate
+          python tests\stream_smoke.py
+
+      - name: Build with PyInstaller
+        shell: cmd
+        run: |
+          call venv\Scripts\activate
+          python packaging\check_flet_bundle.py
+          pyinstaller --name "GLaSSIST" ^
+            --noconsole ^
+            --icon "img/icon.ico" ^
+            --add-data "frontend;frontend" ^
+            --add-data "sound;sound" ^
+            --add-data "img;img" ^
+            --add-data "models;models" ^
+            --add-data "locales;locales" ^
+            --add-data "venv/Lib/site-packages/openwakeword;openwakeword" ^
+            --add-data "venv/Lib/site-packages/onnxruntime/capi/*;onnxruntime/capi/" ^
+            --hidden-import "openwakeword" ^
+            --hidden-import "openwakeword.model" ^
+            --hidden-import "openwakeword.utils" ^
+            --hidden-import "webrtcvad" ^
+            --hidden-import "pystray" ^
+            --hidden-import "PIL" ^
+            --hidden-import "numpy" ^
+            --hidden-import "scipy" ^
+            --hidden-import "onnxruntime" ^
+            --hidden-import "sounddevice" ^
+            --hidden-import "soundfile" ^
+            --hidden-import "miniaudio" ^
+            --hidden-import "webview" ^
+            --hidden-import "websockets" ^
+            --hidden-import "keyboard" ^
+            --collect-all "openwakeword" ^
+            --collect-all "flet_desktop" ^
+            --noconfirm ^
+            main.py
+          if errorlevel 1 exit /b 1
+          python packaging\check_flet_bundle.py "dist\GLaSSIST\_internal\flet_desktop\app\flet"
+          if errorlevel 1 exit /b 1
+          if exist "C:\Windows\System32\MSVCP140.dll" copy "C:\Windows\System32\MSVCP140.dll" "dist\GLaSSIST\_internal\"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $root = "$env:GITHUB_WORKSPACE"
+          (Get-Content setup.iss -Raw) -replace [regex]::Escape('E:\GLaSSIST'), $root | Set-Content setup.iss -Encoding utf8
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc setup.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item inno\GLaSSIST-Setup.exe GLaSSIST-Setup-streaming.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GLaSSIST-Setup-streaming
+          path: GLaSSIST-Setup-streaming.exe
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v3.8.1-streaming.${{ github.run_number }}
+          name: GLaSSIST 3.8.1 + streaming TTS (build ${{ github.run_number }})
+          body: Progressive MP3 playback for TTS (starts on first frames). Unofficial build.
+          prerelease: true
+          files: GLaSSIST-Setup-streaming.exe
