@@ -30,7 +30,8 @@ jobs:
         shell: cmd
         run: |
           call venv\Scripts\activate
-          python tests\stream_smoke.py
+          python tests\stream_smoke.py || exit /b 1
+          python tests\preroll_smoke.py || exit /b 1
 
       - name: Build with PyInstaller
         shell: cmd

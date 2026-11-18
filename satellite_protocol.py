@@ -22,6 +22,7 @@ Adapted from linux-voice-assistant/satellite.py
 """
 
 import asyncio
+import collections
 import logging
 import re
 import threading
@@ -146,6 +147,19 @@ class VoiceSatelliteProtocol(ESPhomeAPIServer):
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Pre-roll: keep the last moments of mic audio while idle so that words
+        # spoken right after the wake word (during detection latency) are not lost.
+        # Lets the user say "Alexa, play music" in one breath, like an Echo.
+        self._audio_lock = threading.Lock()
+        self._preroll = collections.deque()
+        self._preroll_bytes = 0
+        rate = utils.get_env("HA_SAMPLE_RATE", 16000, int)
+        preroll_ms = utils.get_env("HA_PREROLL_MS", 600, int)
+        self._preroll_max = max(0, int(rate * 2 * preroll_ms / 1000))  # 16-bit mono
+        # Play the "got it" chime when speech ends instead of when the wake word fires.
+        self._ack_at_speech_end = utils.get_env(
+            "HA_ACK_AT_SPEECH_END", "true").lower() in ("true", "1", "yes")
+
     # -------------------------------------------------------------------------
     # Public API (called from SatelliteServer / main.py)
     # -------------------------------------------------------------------------
@@ -164,9 +178,22 @@ class VoiceSatelliteProtocol(ESPhomeAPIServer):
 
     def handle_audio(self, audio_chunk: bytes) -> None:
         """Feed a microphone audio chunk — called from audio capture thread."""
-        if not self._is_streaming_audio:
-            return
-        self.send_messages([VoiceAssistantAudio(data=audio_chunk)])
+        with self._audio_lock:
+            if self._is_streaming_audio:
+                self.send_messages([VoiceAssistantAudio(data=audio_chunk)])
+                return
+            if self._preroll_max <= 0:
+                return
+            self._preroll.append(audio_chunk)
+            self._preroll_bytes += len(audio_chunk)
+            while self._preroll and self._preroll_bytes - len(self._preroll[0]) >= self._preroll_max:
+                self._preroll_bytes -= len(self._preroll.popleft())
+
+    def _take_preroll(self) -> list:
+        chunks = list(self._preroll)
+        self._preroll.clear()
+        self._preroll_bytes = 0
+        return chunks
 
     def wakeup(self) -> None:
         """Trigger a pipeline run — called when wake word detected."""
@@ -181,7 +208,7 @@ class VoiceSatelliteProtocol(ESPhomeAPIServer):
             _LOGGER.debug("Wake word blocked — pipeline already active")
             return
 
-        self._start_pipeline_run()
+        self._start_pipeline_run(from_wake_word=True)
 
     def start_conversation(self) -> None:
         """Start pipeline run without wake word (e.g. hotkey trigger)."""
@@ -272,7 +299,8 @@ class VoiceSatelliteProtocol(ESPhomeAPIServer):
             self._is_streaming_audio = False
             self._set_animation("processing")
             if self._feedback_enabled:
-                utils.processing_sound_loop.start()
+                if not utils.processing_sound_loop.start() and self._ack_at_speech_end:
+                    utils.play_feedback_sound("activation")
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_END:
             if data.get("continue_conversation") == "1":
@@ -344,7 +372,7 @@ class VoiceSatelliteProtocol(ESPhomeAPIServer):
     # Pipeline control
     # -------------------------------------------------------------------------
 
-    def _start_pipeline_run(self) -> None:
+    def _start_pipeline_run(self, from_wake_word: bool = False) -> None:
         request = VoiceAssistantRequest(start=True)
         if self._pipeline_id:
             # pipeline_id is passed via HA configuration, not the protobuf message,
@@ -354,20 +382,31 @@ class VoiceSatelliteProtocol(ESPhomeAPIServer):
 
         self._pipeline_active = True
         self._block_wake_words = True
-        self._is_streaming_audio = True
         self._speech_end_handled = False
         self._tts_played = False
         self._continue_conversation = False
 
-        try:
-            self.send_messages([request])
-        except Exception:
-            _LOGGER.exception("Failed to send pipeline start request; resetting state")
-            self._pipeline_active = False
-            self._is_streaming_audio = False
-            return
+        with self._audio_lock:
+            preroll = self._take_preroll() if from_wake_word else []
+            if not from_wake_word:
+                self._take_preroll()
+            self._is_streaming_audio = True
+            try:
+                self.send_messages([request])
+                if preroll:
+                    self.send_messages([VoiceAssistantAudio(data=c) for c in preroll])
+                    _LOGGER.debug("Sent %d ms of pre-roll audio",
+                                  sum(len(c) for c in preroll) * 1000 // 32000)
+            except Exception:
+                _LOGGER.exception("Failed to send pipeline start request; resetting state")
+                self._pipeline_active = False
+                self._is_streaming_audio = False
+                return
         media_ducker.duck()
-        if self._feedback_enabled:
+        # With ack-at-speech-end, a wake-word run starts silently (the chime would
+        # land on top of the user's sentence). Follow-up turns and button presses
+        # still beep, since nothing else tells the user to start talking.
+        if self._feedback_enabled and not (from_wake_word and self._ack_at_speech_end):
             utils.play_feedback_sound("activation")
         self._set_animation("listening")
         _LOGGER.info("Pipeline run started")
