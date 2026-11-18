@@ -45,7 +45,7 @@ jobs:
           python tests\e2e\wake_e2e.py speech.wav . alexa 12 > new_alexa.log 2>&1
           python tests\e2e\wake_e2e.py speech.wav old alexa 12 > old_alexa.log 2>&1
           python tests\e2e\wake_e2e.py speech.wav . glados,alexa,computer_v2 6 > new_default.log 2>&1
-          findstr /B "RESULT protocol loaded Traceback Error" new_alexa.log old_alexa.log new_default.log
+          findstr /R "RESULT protocol loaded wake fake Traceback Error" new_alexa.log old_alexa.log new_default.log
           exit /b 0
 
       - uses: actions/upload-artifact@v4

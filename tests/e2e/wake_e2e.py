@@ -104,6 +104,7 @@ server = satellite_protocol.SatelliteServer(
     on_tts_finished=lambda: None, port=16053)
 
 def on_wake(model_name, confidence):
+    print(f"wake {model_name} {confidence:.3f} at {time.monotonic() - T0:.1f}s", flush=True)
     detections.append((round(time.monotonic() - T0, 2), model_name, round(float(confidence), 3)))
     server.wakeup()
 
@@ -164,18 +165,32 @@ async def fake_home_assistant():
 
 async def main():
     global T0
+    global STAGE
     await server.start()
-    cli = await fake_home_assistant()
+    STAGE = "connect"
+    cli = await asyncio.wait_for(fake_home_assistant(), 20)
+    STAGE = "running"
+    print("fake HA connected", flush=True)
     await asyncio.sleep(1.0)
     T0 = time.monotonic()
     detector.start_detection()
     threading.Thread(target=mic_thread, daemon=True).start()
     await asyncio.sleep(DURATION + 6)
     detector.stop_detection()
-    await cli.disconnect()
-    await server.stop()
+    STAGE = "shutdown"
+    try:
+        await asyncio.wait_for(cli.disconnect(), 5)
+    except Exception as e:
+        print("disconnect:", e, flush=True)
 
 
+def _watchdog():
+    print("RESULT " + json.dumps({"error": "timeout", "stage": STAGE,
+          "detections": detections, "runs": runs}), flush=True)
+    os._exit(2)
+
+STAGE = "start"
+threading.Timer(DURATION + 90, _watchdog).start()
 asyncio.run(main())
 
 # match each utterance with a run that started within 2.5 s after it began
@@ -191,3 +206,4 @@ result = {
     "detection_log": detections,
 }
 print("RESULT " + json.dumps(result), flush=True)
+os._exit(0)
