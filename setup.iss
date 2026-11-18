@@ -230,7 +230,7 @@ begin
       '' + #13#10 +
       '# === WAKE WORD DETECTION ===' + #13#10 +
       'HA_WAKE_WORD_ENABLED=true' + #13#10 +
-      'HA_WAKE_WORD_MODELS=glados,alexa,computer_v2' + #13#10 +
+      'HA_WAKE_WORD_MODELS=alexa' + #13#10 +
       'HA_WAKE_WORD_THRESHOLD=0.5' + #13#10 +
       'HA_WAKE_WORD_VAD_THRESHOLD=0.3' + #13#10 +
       'HA_WAKE_WORD_NOISE_SUPPRESSION=false' + #13#10 +
@@ -244,7 +244,10 @@ begin
 
     // WebSocket: save only when address + token provided
     // ESPHome: always save (HA credentials are optional — only needed for media player control)
-    if ModePage.Values[0] then begin
+    // Upgrades keep the user's settings (wake word, mic, thresholds...).
+    if FileExists(EnvPath) then begin
+      Log('Keeping existing settings: ' + EnvPath);
+    end else if ModePage.Values[0] then begin
       if (HAHost <> '') and (HAToken <> '') then
         SaveStringToFile(EnvPath, EnvContent, False);
     end else begin

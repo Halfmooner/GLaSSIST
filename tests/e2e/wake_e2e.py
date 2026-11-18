@@ -177,11 +177,7 @@ async def main():
     threading.Thread(target=mic_thread, daemon=True).start()
     await asyncio.sleep(DURATION + 6)
     detector.stop_detection()
-    STAGE = "shutdown"
-    try:
-        await asyncio.wait_for(cli.disconnect(), 5)
-    except Exception as e:
-        print("disconnect:", e, flush=True)
+    STAGE = "done"
 
 
 def _watchdog():

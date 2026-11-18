@@ -117,8 +117,41 @@ class HAAssistApp:
                 logger.info("✅ Wake word detection started")
             else:
                 logger.error("❌ Failed to start wake word detection")
+            self._watch_wake_word_settings()
             return success
         return False
+
+    def _watch_wake_word_settings(self):
+        """Apply wake word changes from Settings without restarting GLaSSIST.
+
+        Settings only rewrites .env; before this, a new wake word / threshold
+        silently kept the old values until the app was restarted.
+        """
+        if getattr(self, "_wake_watch_started", False):
+            return
+        self._wake_watch_started = True
+        keys = ("HA_WAKE_WORD_MODELS", "HA_WAKE_WORD_THRESHOLD",
+                "HA_WAKE_WORD_VAD_THRESHOLD", "HA_WAKE_WORD_NOISE_SUPPRESSION",
+                "HA_MICROPHONE_INDEX")
+
+        def snapshot():
+            return tuple(str(utils.get_env(k, "")) for k in keys)
+
+        def watch():
+            import time
+            last = snapshot()
+            while self.is_running:
+                time.sleep(2)
+                try:
+                    cur = snapshot()
+                    if cur != last and self.wake_word_detector and self.wake_word_detector.is_running:
+                        logger.info("Wake word settings changed %s -> %s; reloading", last, cur)
+                        last = cur
+                        self.wake_word_detector.reload_models()
+                except Exception:
+                    logger.exception("Wake word settings watcher error")
+
+        threading.Thread(target=watch, daemon=True, name="wake-settings-watch").start()
     
     def stop_wake_word_detection(self):
         """Stop wake word detection."""

@@ -124,7 +124,11 @@ class WakeWordDetector:
                 else:
                     # Windows: prefer ONNX, avoid TFLite due to compatibility issues
                     if onnx_paths:
-                        model_kwargs['wakeword_models'] = onnx_paths
+                        # Selected built-in models (e.g. "alexa") have no local file.
+                        # Load them by name alongside the local ones; otherwise a mix
+                        # like "glados,alexa" would silently drop alexa.
+                        builtin = self._builtin_models_without_local_file()
+                        model_kwargs['wakeword_models'] = onnx_paths + builtin
                         model_kwargs['inference_framework'] = 'onnx'
                         logger.info(f"Loading ONNX models on Windows: {', '.join(self.selected_models)}")
                     elif tflite_paths:
@@ -175,6 +179,21 @@ class WakeWordDetector:
             self.enabled = False
             return False
     
+    def _builtin_models_without_local_file(self):
+        """Selected names that are openWakeWord built-ins and have no local file."""
+        try:
+            import openwakeword
+            builtin = set(getattr(openwakeword, 'MODELS', {}).keys())
+        except Exception:
+            return []
+        names = []
+        for name in self.selected_models:
+            local = any(os.path.exists(os.path.join(self.models_dir, name + ext))
+                        for ext in ('.onnx', '.tflite'))
+            if not local and name in builtin:
+                names.append(name)
+        return names
+
     def _get_model_paths(self):
         """Get full paths to selected model files with Linux preference."""
         paths = []
