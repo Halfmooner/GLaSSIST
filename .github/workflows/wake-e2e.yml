@@ -1,0 +1,55 @@
+name: Wake word end-to-end
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [streaming-tts, wake-e2e]
+
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: cmd
+        run: |
+          python -m venv venv
+          call venv\Scripts\activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import openwakeword.utils as u; u.download_models()"
+
+      - name: Synthesize speech
+        shell: pwsh
+        run: |
+          powershell -File tests\e2e\make_speech.ps1 -Out speech.wav
+
+      - name: Prepare old protocol (before pre-roll change)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force old | Out-Null
+          git show 97830b7:satellite_protocol.py | Set-Content -Encoding utf8 old\satellite_protocol.py
+
+      - name: Run comparisons
+        shell: cmd
+        run: |
+          call venv\Scripts\activate
+          python tests\e2e\wake_e2e.py speech.wav . alexa 12 > new_alexa.log 2>&1
+          python tests\e2e\wake_e2e.py speech.wav old alexa 12 > old_alexa.log 2>&1
+          python tests\e2e\wake_e2e.py speech.wav . glados,alexa,computer_v2 6 > new_default.log 2>&1
+          findstr /B "RESULT protocol loaded Traceback Error" new_alexa.log old_alexa.log new_default.log
+          exit /b 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs
+          path: "*.log"
